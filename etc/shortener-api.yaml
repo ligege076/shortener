@@ -7,3 +7,9 @@ ShortUrlDB:
 
 Sequence:
   DSN: root:123456@tcp(127.0.0.1:3306)/db1?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
+
+BaseString: abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+
+ShortUrlBlackList: ["version", "fuxk", "stupid", "convert", "health", "api", "css", "js"]
+
+ShortDomain: qimi.cn

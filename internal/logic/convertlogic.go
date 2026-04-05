@@ -11,6 +11,8 @@ import (
 
 	"shortener/internal/svc"
 	"shortener/internal/types"
+	"shortener/model"
+	"shortener/pkg/base62"
 	"shortener/pkg/connect"
 	"shortener/pkg/md5"
 	"shortener/pkg/urltool"
@@ -82,9 +84,46 @@ func (l *ConvertLogic) Convert(req *types.ConvertRequest) (resp *types.ConvertRe
 
 	fmt.Println(seq)
 
-	// 3. 号码转短链
-	// 4. 存储长短链接映射关系
-	// 5. 返回响应
+	// 2. 取号，基于 MySQL 实现的发号器
+	var short string
+	for {
+		seq, err := l.svcCtx.Sequence.Next()
+		if err != nil {
+			logx.Errorw("Sequence.Next() failed",
+				logx.LogField{Key: "err", Value: err.Error()},
+			)
+			return nil, err
+		}
 
-	return
+		fmt.Println(seq) // 调试输出
+
+		// 3. 号码转短链
+		short = base62.Int2String(seq)
+
+		// 3.2 黑名单判断，像 api、health 这种保留字跳过
+		if _, ok := l.svcCtx.ShortUrlBlackList[short]; !ok {
+			break
+		}
+	}
+
+	// 4. 将长链接和短链接映射关系写入数据库
+	if _, err = l.svcCtx.ShortUrlModel.Insert(
+		l.ctx,
+		&model.ShortUrlMap{
+			Lurl: sql.NullString{String: req.LongUrl, Valid: true},
+			Md5:  sql.NullString{String: md5Value, Valid: true},
+			Surl: sql.NullString{String: short, Valid: true},
+		},
+	); err != nil {
+		logx.Errorw("ShortUrlModel.Insert() failed",
+			logx.LogField{Key: "err", Value: err.Error()},
+		)
+		return nil, err
+	}
+
+	// 5. 返回响应
+	shortUrl := l.svcCtx.Config.ShortDomain + "/" + short
+	return &types.ConvertResponse{
+		ShortUrl: shortUrl,
+	}, nil
 }
