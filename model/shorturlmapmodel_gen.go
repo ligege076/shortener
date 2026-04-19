@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zeromicro/go-zero/core/stores/builder"
+	"github.com/zeromicro/go-zero/core/stores/cache"
+	"github.com/zeromicro/go-zero/core/stores/sqlc"
 	"github.com/zeromicro/go-zero/core/stores/sqlx"
 	"github.com/zeromicro/go-zero/core/stringx"
 )
@@ -21,6 +23,10 @@ var (
 	shortUrlMapRows                = strings.Join(shortUrlMapFieldNames, ",")
 	shortUrlMapRowsExpectAutoSet   = strings.Join(stringx.Remove(shortUrlMapFieldNames, "`id`", "`create_at`", "`create_time`", "`created_at`", "`update_at`", "`update_time`", "`updated_at`"), ",")
 	shortUrlMapRowsWithPlaceHolder = strings.Join(stringx.Remove(shortUrlMapFieldNames, "`id`", "`create_at`", "`create_time`", "`created_at`", "`update_at`", "`update_time`", "`updated_at`"), "=?,") + "=?"
+
+	cacheDb1ShortUrlMapIdPrefix   = "cache:db1:shortUrlMap:id:"
+	cacheDb1ShortUrlMapMd5Prefix  = "cache:db1:shortUrlMap:md5:"
+	cacheDb1ShortUrlMapSurlPrefix = "cache:db1:shortUrlMap:surl:"
 )
 
 type (
@@ -34,7 +40,9 @@ type (
 	}
 
 	defaultShortUrlMapModel struct {
-		conn  sqlx.SqlConn
+		// CachedConn 封装了 go-zero 的缓存读写逻辑：
+		// 读时先查 Redis，未命中再查 MySQL 并回填；写成功后删除相关缓存键。
+		sqlc.CachedConn
 		table string
 	}
 
@@ -49,27 +57,44 @@ type (
 	}
 )
 
-func newShortUrlMapModel(conn sqlx.SqlConn) *defaultShortUrlMapModel {
+func newShortUrlMapModel(conn sqlx.SqlConn, c cache.CacheConf, opts ...cache.Option) *defaultShortUrlMapModel {
 	return &defaultShortUrlMapModel{
-		conn:  conn,
-		table: "`short_url_map`",
+		// 在这里把当前表的 MySQL 连接和 Redis 缓存正式绑定起来。
+		CachedConn: sqlc.NewConn(conn, c, opts...),
+		table:      "`short_url_map`",
 	}
 }
 
 func (m *defaultShortUrlMapModel) Delete(ctx context.Context, id uint64) error {
-	query := fmt.Sprintf("delete from %s where `id` = ?", m.table)
-	_, err := m.conn.ExecCtx(ctx, query, id)
+	// 先拿到旧记录，后面删除时要顺手清掉 id/md5/surl 三组缓存键。
+	data, err := m.FindOne(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	db1ShortUrlMapIdKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapIdPrefix, id)
+	db1ShortUrlMapMd5Key := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapMd5Prefix, data.Md5)
+	db1ShortUrlMapSurlKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapSurlPrefix, data.Surl)
+	// ExecCtx 会在数据库删除成功后，把这些相关缓存键一起删掉。
+	_, err = m.ExecCtx(ctx, func(ctx context.Context, conn sqlx.SqlConn) (result sql.Result, err error) {
+		query := fmt.Sprintf("delete from %s where `id` = ?", m.table)
+		return conn.ExecCtx(ctx, query, id)
+	}, db1ShortUrlMapIdKey, db1ShortUrlMapMd5Key, db1ShortUrlMapSurlKey)
 	return err
 }
 
 func (m *defaultShortUrlMapModel) FindOne(ctx context.Context, id uint64) (*ShortUrlMap, error) {
-	query := fmt.Sprintf("select %s from %s where `id` = ? limit 1", shortUrlMapRows, m.table)
+	db1ShortUrlMapIdKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapIdPrefix, id)
 	var resp ShortUrlMap
-	err := m.conn.QueryRowCtx(ctx, &resp, query, id)
+	// 主键查询走这里：先查 Redis，没命中才回源 MySQL，并把结果写回缓存。
+	err := m.QueryRowCtx(ctx, &resp, db1ShortUrlMapIdKey, func(ctx context.Context, conn sqlx.SqlConn, v any) error {
+		query := fmt.Sprintf("select %s from %s where `id` = ? limit 1", shortUrlMapRows, m.table)
+		return conn.QueryRowCtx(ctx, v, query, id)
+	})
 	switch err {
 	case nil:
 		return &resp, nil
-	case sqlx.ErrNotFound:
+	case sqlc.ErrNotFound:
 		return nil, ErrNotFound
 	default:
 		return nil, err
@@ -77,13 +102,20 @@ func (m *defaultShortUrlMapModel) FindOne(ctx context.Context, id uint64) (*Shor
 }
 
 func (m *defaultShortUrlMapModel) FindOneByMd5(ctx context.Context, md5 sql.NullString) (*ShortUrlMap, error) {
+	db1ShortUrlMapMd5Key := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapMd5Prefix, md5)
 	var resp ShortUrlMap
-	query := fmt.Sprintf("select %s from %s where `md5` = ? limit 1", shortUrlMapRows, m.table)
-	err := m.conn.QueryRowCtx(ctx, &resp, query, md5)
+	// 二级索引查询会先查 md5 对应的缓存键，再通过主键缓存拿整行数据。
+	err := m.QueryRowIndexCtx(ctx, &resp, db1ShortUrlMapMd5Key, m.formatPrimary, func(ctx context.Context, conn sqlx.SqlConn, v any) (i any, e error) {
+		query := fmt.Sprintf("select %s from %s where `md5` = ? limit 1", shortUrlMapRows, m.table)
+		if err := conn.QueryRowCtx(ctx, &resp, query, md5); err != nil {
+			return nil, err
+		}
+		return resp.Id, nil
+	}, m.queryPrimary)
 	switch err {
 	case nil:
 		return &resp, nil
-	case sqlx.ErrNotFound:
+	case sqlc.ErrNotFound:
 		return nil, ErrNotFound
 	default:
 		return nil, err
@@ -91,13 +123,20 @@ func (m *defaultShortUrlMapModel) FindOneByMd5(ctx context.Context, md5 sql.Null
 }
 
 func (m *defaultShortUrlMapModel) FindOneBySurl(ctx context.Context, surl sql.NullString) (*ShortUrlMap, error) {
+	db1ShortUrlMapSurlKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapSurlPrefix, surl)
 	var resp ShortUrlMap
-	query := fmt.Sprintf("select %s from %s where `surl` = ? limit 1", shortUrlMapRows, m.table)
-	err := m.conn.QueryRowCtx(ctx, &resp, query, surl)
+	// 短链跳转最常用的就是这个入口，优先读 surl 缓存，缓存未命中再查库。
+	err := m.QueryRowIndexCtx(ctx, &resp, db1ShortUrlMapSurlKey, m.formatPrimary, func(ctx context.Context, conn sqlx.SqlConn, v any) (i any, e error) {
+		query := fmt.Sprintf("select %s from %s where `surl` = ? limit 1", shortUrlMapRows, m.table)
+		if err := conn.QueryRowCtx(ctx, &resp, query, surl); err != nil {
+			return nil, err
+		}
+		return resp.Id, nil
+	}, m.queryPrimary)
 	switch err {
 	case nil:
 		return &resp, nil
-	case sqlx.ErrNotFound:
+	case sqlc.ErrNotFound:
 		return nil, ErrNotFound
 	default:
 		return nil, err
@@ -105,15 +144,42 @@ func (m *defaultShortUrlMapModel) FindOneBySurl(ctx context.Context, surl sql.Nu
 }
 
 func (m *defaultShortUrlMapModel) Insert(ctx context.Context, data *ShortUrlMap) (sql.Result, error) {
-	query := fmt.Sprintf("insert into %s (%s) values (?, ?, ?, ?, ?)", m.table, shortUrlMapRowsExpectAutoSet)
-	ret, err := m.conn.ExecCtx(ctx, query, data.CreateBy, data.IsDel, data.Lurl, data.Md5, data.Surl)
+	db1ShortUrlMapIdKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapIdPrefix, data.Id)
+	db1ShortUrlMapMd5Key := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapMd5Prefix, data.Md5)
+	db1ShortUrlMapSurlKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapSurlPrefix, data.Surl)
+	// 新增成功后同样会删掉相关缓存键，避免读到旧的空值缓存。
+	ret, err := m.ExecCtx(ctx, func(ctx context.Context, conn sqlx.SqlConn) (result sql.Result, err error) {
+		query := fmt.Sprintf("insert into %s (%s) values (?, ?, ?, ?, ?)", m.table, shortUrlMapRowsExpectAutoSet)
+		return conn.ExecCtx(ctx, query, data.CreateBy, data.IsDel, data.Lurl, data.Md5, data.Surl)
+	}, db1ShortUrlMapIdKey, db1ShortUrlMapMd5Key, db1ShortUrlMapSurlKey)
 	return ret, err
 }
 
 func (m *defaultShortUrlMapModel) Update(ctx context.Context, newData *ShortUrlMap) error {
-	query := fmt.Sprintf("update %s set %s where `id` = ?", m.table, shortUrlMapRowsWithPlaceHolder)
-	_, err := m.conn.ExecCtx(ctx, query, newData.CreateBy, newData.IsDel, newData.Lurl, newData.Md5, newData.Surl, newData.Id)
+	// 先查旧值，是为了拿到更新前的 md5/surl 缓存键，保证失效删除完整。
+	data, err := m.FindOne(ctx, newData.Id)
+	if err != nil {
+		return err
+	}
+
+	db1ShortUrlMapIdKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapIdPrefix, data.Id)
+	db1ShortUrlMapMd5Key := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapMd5Prefix, data.Md5)
+	db1ShortUrlMapSurlKey := fmt.Sprintf("%s%v", cacheDb1ShortUrlMapSurlPrefix, data.Surl)
+	// ExecCtx 负责在数据库更新成功后统一清理这些缓存键。
+	_, err = m.ExecCtx(ctx, func(ctx context.Context, conn sqlx.SqlConn) (result sql.Result, err error) {
+		query := fmt.Sprintf("update %s set %s where `id` = ?", m.table, shortUrlMapRowsWithPlaceHolder)
+		return conn.ExecCtx(ctx, query, newData.CreateBy, newData.IsDel, newData.Lurl, newData.Md5, newData.Surl, newData.Id)
+	}, db1ShortUrlMapIdKey, db1ShortUrlMapMd5Key, db1ShortUrlMapSurlKey)
 	return err
+}
+
+func (m *defaultShortUrlMapModel) formatPrimary(primary any) string {
+	return fmt.Sprintf("%s%v", cacheDb1ShortUrlMapIdPrefix, primary)
+}
+
+func (m *defaultShortUrlMapModel) queryPrimary(ctx context.Context, conn sqlx.SqlConn, v, primary any) error {
+	query := fmt.Sprintf("select %s from %s where `id` = ? limit 1", shortUrlMapRows, m.table)
+	return conn.QueryRowCtx(ctx, v, query, primary)
 }
 
 func (m *defaultShortUrlMapModel) tableName() string {

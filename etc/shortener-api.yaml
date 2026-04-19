@@ -13,3 +13,10 @@ BaseString: abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
 ShortUrlBlackList: ["version", "fuxk", "stupid", "convert", "health", "api", "css", "js"]
 
 ShortDomain: qimi.cn
+
+CacheRedis:
+  - Host: 127.0.0.1:6379
+    Pass: "123456"
+
+
+  

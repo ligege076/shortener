@@ -21,15 +21,16 @@ type ServiceContext struct {
 func NewServiceContext(c config.Config) *ServiceContext {
 	conn := sqlx.NewMysql(c.ShortUrlDB.DSN)
 
-	// 把配置文件中的黑名单加载到 map，方便后续快速判断
 	m := make(map[string]struct{}, len(c.ShortUrlBlackList))
 	for _, v := range c.ShortUrlBlackList {
 		m[v] = struct{}{}
 	}
 
 	return &ServiceContext{
-		Config:            c,
-		ShortUrlModel:     model.NewShortUrlMapModel(conn),
+		Config: c,
+		// goctl 不会自动改 svc，这里必须手动把 CacheRedis 传给 model，
+		// model 里的 CachedConn 才会真正启用 Redis 缓存。
+		ShortUrlModel:     model.NewShortUrlMapModel(conn, c.CacheRedis),
 		Sequence:          sequence.NewMySQL(c.Sequence.DSN),
 		ShortUrlBlackList: m,
 	}
