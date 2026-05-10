@@ -120,7 +120,10 @@ func (l *ConvertLogic) Convert(req *types.ConvertRequest) (resp *types.ConvertRe
 		)
 		return nil, err
 	}
-
+	// 4.1 把新生成的短链接加入布隆过滤器
+	if err := l.svcCtx.Filter.Add([]byte(short)); err != nil {
+		logx.Errorw("BloomFilter.Add() failed", logx.LogField{Key: "shortUrl", Value: short}, logx.LogField{Key: "err", Value: err.Error()})
+	}
 	// 5. 返回响应
 	shortUrl := l.svcCtx.Config.ShortDomain + "/" + short
 	return &types.ConvertResponse{
