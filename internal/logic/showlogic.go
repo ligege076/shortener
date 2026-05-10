@@ -30,7 +30,11 @@ func NewShowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ShowLogic {
 }
 
 func (l *ShowLogic) Show(req *types.ShowRequest) (resp *types.ShowResponse, err error) {
-	// 根据短链标识查询数据库中的长短链映射关系。
+	// 查看短链接，输入 q1mi.cn/lusytc -> 重定向到真实的链接
+	// req.ShortUrl = lusytc
+	// 1. 根据短链接查询原始的长链接
+	// 1.1 查询数据库之前可增加缓存层
+	// go-zero的缓存支持singleflight
 	u, err := l.svcCtx.ShortUrlModel.FindOneBySurl(
 		l.ctx,
 		sql.NullString{String: req.ShortUrl, Valid: true},
